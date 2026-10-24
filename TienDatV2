@@ -1,0 +1,2350 @@
+-- ╔══════════════════════════════════════════════════════════════════════════╗
+-- ║  ZERO TIGER v4.2 — COMPLETE SINGLE-FILE EDITION                          ║
+-- ║  Blox Fruits · W-AZURE Architecture · 15 modules · 250+ WAF criteria     ║
+-- ║  Tất cả trong một file — không cần upload, không cần BASE_URL            ║
+-- ╚══════════════════════════════════════════════════════════════════════════╝
+
+if getgenv().ZeroTiger_Loaded then
+    pcall(function() getgenv().ZeroTiger_Unload() end)
+    task.wait(0.5)
+end
+getgenv().ZeroTiger_Loaded = true
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  SERVICES
+-- ══════════════════════════════════════════════════════════════════════════
+local Services = {
+    Players          = game:GetService("Players"),
+    RunService       = game:GetService("RunService"),
+    HttpService      = game:GetService("HttpService"),
+    TweenService     = game:GetService("TweenService"),
+    VirtualUser      = game:GetService("VirtualUser"),
+    TeleportService  = game:GetService("TeleportService"),
+    UserInputService = game:GetService("UserInputService"),
+    Lighting         = game:GetService("Lighting"),
+    LP               = game:GetService("Players").LocalPlayer,
+}
+
+repeat task.wait() until game:IsLoaded() and Services.LP.Character
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  CORE — Supervisor, EventBus, Logger, Cache
+-- ══════════════════════════════════════════════════════════════════════════
+local Core = {}
+
+Core.VERSION = "4.2.0"
+Core.GAME    = "Blox Fruits"
+
+Core.State = {
+    Status  = "LOADING",
+    Modules = {},
+    Config  = {
+        PlayerName       = Services.LP.Name,
+        WebhookURL       = "",
+        MaxRestarts      = 5,
+        RestartWindow    = 60,
+        HealthCheckEvery = 15,
+        LogLevel         = 3,
+    },
+    Cache    = {},
+    EventBus = {},
+}
+
+local RANK = { DEBUG = 4, INFO = 3, WARN = 2, ERROR = 1 }
+
+function Core.Log(module, level, msg)
+    module = module or "CORE"
+    level  = level  or "INFO"
+    if (RANK[level] or 0) > (Core.State.Config.LogLevel or 3) then return end
+    local line = string.format("[ZT][%s][%s] %s", module, level, tostring(msg))
+    print(line)
+    if level == "ERROR" and Core.State.Config.WebhookURL ~= "" then
+        task.spawn(function()
+            pcall(function()
+                local H = game:GetService("HttpService")
+                request({
+                    Url = Core.State.Config.WebhookURL,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = H:JSONEncode({
+                        username = "ZeroTiger v4.2",
+                        content = string.format("**%s** `%s` %s",
+                            Core.State.Config.PlayerName, module, tostring(msg))
+                    })
+                })
+            end)
+        end)
+    end
+end
+
+function Core.On(name, fn)
+    Core.State.EventBus[name] = Core.State.EventBus[name] or {}
+    table.insert(Core.State.EventBus[name], fn)
+    return fn
+end
+
+function Core.Emit(name, data)
+    local hs = Core.State.EventBus[name]
+    if not hs then return end
+    for _, fn in ipairs(hs) do
+        pcall(fn, data)
+    end
+end
+
+function Core.StartModule(name, fn)
+    local old = Core.State.Modules[name]
+    if old and old.thread then pcall(task.cancel, old.thread) end
+    local mod = {
+        fn = fn, restartCount = 0, firstRestart = tick(),
+        status = "RUNNING", lastError = nil,
+    }
+    Core.State.Modules[name] = mod
+    mod.thread = task.spawn(function()
+        while Core.State.Status ~= "UNLOADED" do
+            local ok, err = pcall(fn)
+            if ok then break end
+            mod.lastError = tostring(err)
+            Core.Log(name, "ERROR", "crash: "..mod.lastError)
+            if tick() - mod.firstRestart > Core.State.Config.RestartWindow then
+                mod.restartCount = 0
+                mod.firstRestart = tick()
+            end
+            mod.restartCount = mod.restartCount + 1
+            if mod.restartCount > Core.State.Config.MaxRestarts then
+                Core.Log(name, "ERROR", "restart limit — DISABLED")
+                mod.status = "DISABLED"
+                break
+            end
+            task.wait(2)
+        end
+    end)
+end
+
+function Core.StopModule(name)
+    local mod = Core.State.Modules[name]
+    if not mod then return end
+    if mod.thread then pcall(task.cancel, mod.thread); mod.thread = nil end
+    mod.status = "STOPPED"
+end
+
+function Core.Cached(key, ttl, fetchFn)
+    local e = Core.State.Cache[key]
+    if e and tick() - e.time < ttl then return e.value end
+    local ok, v = pcall(fetchFn)
+    if ok then
+        Core.State.Cache[key] = { value = v, time = tick() }
+        return v
+    end
+    return e and e.value or nil
+end
+
+function Core.StartHealthCheck()
+    task.spawn(function()
+        while Core.State.Status ~= "UNLOADED" do
+            task.wait(Core.State.Config.HealthCheckEvery)
+            for name, mod in pairs(Core.State.Modules) do
+                if mod.status == "RUNNING" and mod.thread
+                   and coroutine.status(mod.thread) == "dead" then
+                    Core.Log(name, "WARN", "health: restart dead thread")
+                    Core.StartModule(name, mod.fn)
+                end
+            end
+        end
+    end)
+end
+
+function Core.Shutdown()
+    Core.Log("CORE", "INFO", "shutdown")
+    Core.Emit("Core:Unload")
+    for _, mod in pairs(Core.State.Modules) do
+        if mod.thread then pcall(task.cancel, mod.thread) end
+    end
+    Core.State.Status = "UNLOADED"
+end
+
+Core.State.Status = "RUNNING"
+Core.StartHealthCheck()
+getgenv().ZeroTiger_Unload = Core.Shutdown
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  BLOX FRUITS API — glue layer, remote resolver, combat hook
+-- ══════════════════════════════════════════════════════════════════════════
+local API = {}
+
+local API_State = {
+    CommF        = nil,
+    CommE        = nil,
+    CombatActive = nil,
+    Hooked       = false,
+    LastResolve  = 0,
+}
+
+local RS = game:GetService("ReplicatedStorage")
+local LP = Services.LP
+
+-- ── Remote resolver ──────────────────────────────────────────────────────
+local function ResolveRemotes()
+    local resolved = { CommF = nil, CommE = nil, paths = {} }
+
+    local remotes = RS:FindFirstChild("Remotes")
+    if remotes then
+        resolved.CommF = remotes:FindFirstChild("CommF_")
+        resolved.CommE = remotes:FindFirstChild("CommE")
+        if resolved.CommF then table.insert(resolved.paths, "Remotes/CommF_") end
+        if resolved.CommE then table.insert(resolved.paths, "Remotes/CommE") end
+    end
+
+    if not resolved.CommF then
+        resolved.CommF = RS:FindFirstChild("CommF_")
+        if resolved.CommF then table.insert(resolved.paths, "RS/CommF_") end
+    end
+    if not resolved.CommE then
+        resolved.CommE = RS:FindFirstChild("CommE")
+        if resolved.CommE then table.insert(resolved.paths, "RS/CommE") end
+    end
+
+    if not resolved.CommF then
+        resolved.CommF = RS:FindFirstChild("CommF_", true)
+        if resolved.CommF then table.insert(resolved.paths, "recursive/CommF_") end
+    end
+    if not resolved.CommE then
+        resolved.CommE = RS:FindFirstChild("CommE", true)
+        if resolved.CommE then table.insert(resolved.paths, "recursive/CommE") end
+    end
+
+    if not resolved.CommF then
+        for _, alt in ipairs({ "CommF", "CommunicationF", "RemoteF_" }) do
+            local r = RS:FindFirstChild(alt, true)
+            if r and r:IsA("RemoteFunction") then
+                resolved.CommF = r
+                table.insert(resolved.paths, "alt/"..alt)
+                break
+            end
+        end
+    end
+
+    if resolved.CommF then
+        API_State.CommF = resolved.CommF
+        Core.Log("API", "INFO", "CommF_ resolved via: "..table.concat(resolved.paths, ", "))
+    else
+        Core.Log("API", "ERROR", "CommF_ NOT FOUND — auto-buy/stat sẽ không hoạt động")
+    end
+    if resolved.CommE then
+        API_State.CommE = resolved.CommE
+    end
+
+    API_State.LastResolve = tick()
+    return resolved.CommF ~= nil
+end
+
+-- ── Combat hook ──────────────────────────────────────────────────────────
+local function HookCombat()
+    pcall(function()
+        require(RS.Util.CameraShaker):Stop()
+    end)
+    local ok, reg = pcall(getreg)
+    if not ok then return false end
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local cf = ps and ps:FindFirstChild("CombatFramework")
+    if not cf then return false end
+
+    for _, v in ipairs(reg) do
+        if typeof(v) == "function" then
+            local ok2, env = pcall(getfenv, v)
+            if ok2 and env and env.script == cf then
+                local ok3, ups = pcall(debug.getupvalues, v)
+                if ok3 and ups then
+                    for _, uv in ipairs(ups) do
+                        if typeof(uv) == "table" and uv.activeController then
+                            API_State.CombatActive = uv
+                            API_State.Hooked = true
+                            Core.Log("API", "INFO", "combat hook OK")
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    Core.Log("API", "WARN", "combat hook failed — fallback mode")
+    return false
+end
+
+-- ── Safe invoke ──────────────────────────────────────────────────────────
+local function SafeInvoke(remote, ...)
+    if not remote then return false end
+    local ok1 = pcall(function() remote:InvokeServer(...) end)
+    if ok1 then return true end
+    local ok2 = pcall(function() remote:FireServer(...) end)
+    if ok2 then return true end
+    Core.Log("API", "WARN", "invoke failed on "..remote.Name)
+    return false
+end
+
+local function EnsureRemote()
+    if API_State.CommF and API_State.CommF.Parent then return true end
+    if tick() - API_State.LastResolve < 5 then return API_State.CommF ~= nil end
+    return ResolveRemotes()
+end
+
+local function EnsureHook()
+    if API_State.Hooked and API_State.CombatActive then return true end
+    return HookCombat()
+end
+
+-- ── Pattern tables ───────────────────────────────────────────────────────
+local Patterns = {
+    Fruit = {
+        "Bomb-Bomb","Spike-Spike","Chop-Chop","Spring-Spring",
+        "Kilo-Kilo","Smoke-Smoke","Flame-Flame","Ice-Ice",
+        "Sand-Sand","Dark-Dark","Ghost-Ghost","Diamond-Diamond",
+        "Light-Light","Rubber-Rubber","Barrier-Barrier","Magma-Magma",
+        "Door-Door","Venom-Venom","Human-Human","Buddha-Buddha",
+        "Love-Love","Spider-Spider","Sound-Sound","Phoenix-Phoenix",
+        "Portal-Portal","Rumble-Rumble","Paw-Paw","Gravity-Gravity",
+        "Dough-Dough","Shadow-Shadow","Control-Control","Spirit-Spirit",
+        "Dragon-Dragon","Leopard-Leopard","Kitsune-Kitsune",
+        "Mammoth-Mammoth","T-Rex","Gas-Gas","Yeti-Yeti",
+        "Blade-Blade","Creation-Creation",
+    },
+    Boss = {
+        "Rip_Indra","Cake_Prince","Cake_Queen","Dough_King",
+        "Longma","Soul_Reaper","Greybeard","Ice_Fisherman",
+        "Thunder_GOD","Cursed_Captain","Darkbeard","Order",
+        "Katakuri","Big_Mom","Kaido",
+    },
+}
+
+-- ── Public API ───────────────────────────────────────────────────────────
+function API.EnsureCombatHook() return EnsureHook() end
+function API.HasBuso()
+    local char = LP.Character
+    if not char then return false end
+    return char:FindFirstChild("HasBuso") ~= nil
+end
+
+function API.EnableBuso()
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "Buso")
+end
+
+function API.StartQuest(name, number)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "StartQuest", name, number)
+end
+
+function API.AbandonQuest()
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "AbandonQuest")
+end
+
+function API.SelectRaid(mapName)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "RaidsNpc", "Select", mapName)
+end
+
+function API.BuyHaki(type_)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuyHaki", type_)
+end
+
+function API.BuyGeppo()
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuyHaki", "Geppo")
+end
+
+function API.BuySoru()
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuyHaki", "Soru")
+end
+
+function API.BuySword(name)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuySword", name)
+end
+
+function API.BuyGun(name)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuyGun", name)
+end
+
+function API.BuyFruit(name)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "BuyFruit", name)
+end
+
+function API.SetStat(stat, n)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "AddPoint", stat, n or 1)
+end
+
+function API.EquipTool(name)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "EquipTool", name)
+end
+
+function API.GetFruits()
+    EnsureRemote()
+    local ok, result = pcall(function()
+        return API_State.CommF:InvokeServer("GetFruits")
+    end)
+    return ok and result or {}
+end
+
+function API.StoreFruit(name, tool)
+    EnsureRemote()
+    return SafeInvoke(API_State.CommF, "StoreFruit", name, tool)
+end
+
+function API.IsFruitName(name)
+    for _, p in ipairs(Patterns.Fruit) do
+        if name:lower():find(p:lower(), 1, true) then return true, p end
+    end
+    return false
+end
+
+function API.IsBossName(name)
+    local n = name:lower():gsub("_", " ")
+    for _, b in ipairs(Patterns.Boss) do
+        local bl = b:lower():gsub("_", " ")
+        if n:find(bl, 1, true) then return true, b end
+    end
+    return false
+end
+
+function API.IsChestModel(obj)
+    if not obj or not obj.Parent then return false end
+    if not obj:IsA("Model") then return false end
+    local n = obj.Name:lower()
+    if not n:find("chest") and not n:find("crate") and not n:find("box") then
+        return false
+    end
+    local pp = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if not pp then return false end
+    return true
+end
+
+function API.ScanFruits(maxRange)
+    local fruits = {}
+    local lp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local isF, pname = API.IsFruitName(obj.Name)
+        if isF then
+            local handle = obj:FindFirstChild("Handle")
+                         or (obj:IsA("BasePart") and obj)
+                         or obj.PrimaryPart
+            if handle then
+                if not maxRange or not lp
+                   or (handle.Position - lp.Position).Magnitude <= maxRange then
+                    table.insert(fruits, { obj = obj, handle = handle, name = pname })
+                end
+            end
+        end
+    end
+    return fruits
+end
+
+function API.ScanChests(maxRange)
+    local chests = {}
+    local lp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if API.IsChestModel(obj) then
+            local pr = obj.PrimaryPart
+                    or obj:FindFirstChild("HumanoidRootPart")
+                    or obj:FindFirstChildWhichIsA("BasePart")
+            if pr then
+                if not maxRange or not lp
+                   or (pr.Position - lp.Position).Magnitude <= maxRange then
+                    table.insert(chests, { obj = obj, part = pr })
+                end
+            end
+        end
+    end
+    return chests
+end
+
+function API.ScanBosses(maxRange)
+    local bosses = {}
+    local lp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local env = workspace:FindFirstChild("Enemies")
+    local containers = { env, workspace }
+    for _, c in ipairs(containers) do
+        if c then
+            for _, m in ipairs(c:GetChildren()) do
+                if m:IsA("Model") and API.IsBossName(m.Name) then
+                    local h = m:FindFirstChildOfClass("Humanoid")
+                    local r = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+                    if h and h.Health > 0 and r then
+                        if not maxRange or not lp
+                           or (r.Position - lp.Position).Magnitude <= maxRange then
+                            table.insert(bosses, { model = m, hrp = r, hum = h })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bosses
+end
+
+function API.GetState()
+    return {
+        CommF    = API_State.CommF ~= nil,
+        CommE    = API_State.CommE ~= nil,
+        Hooked   = API_State.Hooked,
+    }
+end
+
+ResolveRemotes()
+HookCombat()
+
+-- Health loop for remote
+Core.StartModule("API_ResolveCheck", function()
+    while Core.State.Status ~= "UNLOADED" do
+        task.wait(20)
+        if API_State.CommF and not API_State.CommF.Parent then
+            Core.Log("API", "WARN", "CommF_ invalidated — re-resolving")
+            API_State.CommF = nil
+            ResolveRemotes()
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 1 — FastAttack
+-- ══════════════════════════════════════════════════════════════════════════
+local FastAttack = {}
+local FA_Config = {
+    HitboxMagnitude = 150,
+    AttackIncrement = 4,
+    ThrottleMs      = 16,
+    FallbackCooldown= 0.05,
+    MaxHookAttempts = 10,
+}
+local FA_State = { Enabled = false, Hooked = false, AttackCount = 0, LastAttack = 0, Upvalues = nil, HookConn = nil }
+
+local function FA_scanForActiveController()
+    local ok, reg = pcall(getreg)
+    if not ok then return nil end
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local cf = ps and ps:FindFirstChild("CombatFramework")
+    if not cf then return nil end
+    local attempts = 0
+    for _, v in ipairs(reg) do
+        if attempts >= FA_Config.MaxHookAttempts then break end
+        if typeof(v) == "function" then
+            local ok2, env = pcall(getfenv, v)
+            if ok2 and env and env.script == cf then
+                attempts = attempts + 1
+                local ok3, ups = pcall(debug.getupvalues, v)
+                if ok3 and ups then
+                    for _, uv in ipairs(ups) do
+                        if typeof(uv) == "table" and uv.activeController then
+                            Core.Log("FastAttack", "INFO", "hook found after "..attempts.." scans")
+                            return uv
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function FA_applyStats(ac)
+    if not ac then return end
+    if ac.attacking == nil and ac.timeToNextAttack == nil then return end
+    ac.timeToNextAttack = -math.huge
+    ac.attacking        = false
+    ac.increment        = FA_Config.AttackIncrement
+    ac.blocking         = false
+    ac.hitboxMagnitude  = FA_Config.HitboxMagnitude
+    if ac.humanoid then ac.humanoid.AutoRotate = true end
+end
+
+local function FA_fallbackAttack()
+    local now = tick()
+    if now - FA_State.LastAttack < FA_Config.FallbackCooldown then return end
+    FA_State.LastAttack = now
+    local char = LP.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then pcall(function() tool:Activate() end) end
+    pcall(function()
+        Services.VirtualUser:CaptureController()
+        Services.VirtualUser:Button1Down(Vector2.zero)
+        Services.VirtualUser:Button1Up(Vector2.zero)
+    end)
+    FA_State.AttackCount = FA_State.AttackCount + 1
+end
+
+local function FA_onRenderStep()
+    if not FA_State.Enabled then return end
+    if Core.State.Status ~= "RUNNING" then return end
+    local now = tick()
+    if (now - (FA_State.LastFrame or 0)) * 1000 < FA_Config.ThrottleMs then return end
+    FA_State.LastFrame = now
+    local char = LP.Character
+    if not char then return end
+    if FA_State.Upvalues and FA_State.Upvalues.activeController then
+        pcall(FA_applyStats, FA_State.Upvalues.activeController)
+    else
+        FA_fallbackAttack()
+    end
+end
+
+local function FA_ensureHooked()
+    if FA_State.Hooked and FA_State.HookConn and FA_State.HookConn.Connected then return end
+    if not FA_State.Upvalues then
+        FA_State.Upvalues = FA_scanForActiveController()
+        if not FA_State.Upvalues then
+            if not FA_State.HookConn then
+                FA_State.HookConn = Services.RunService.RenderStepped:Connect(FA_onRenderStep)
+            end
+            FA_State.Hooked = true
+            return
+        end
+    end
+    if not FA_State.HookConn then
+        FA_State.HookConn = Services.RunService.RenderStepped:Connect(FA_onRenderStep)
+    end
+    FA_State.Hooked = true
+end
+
+function FastAttack.Toggle(on)
+    if on == FA_State.Enabled then return end
+    FA_State.Enabled = on
+    if on then
+        FA_ensureHooked()
+        Core.Log("FastAttack", "INFO", "BẬT")
+    else
+        if FA_State.HookConn then
+            pcall(function() FA_State.HookConn:Disconnect() end)
+            FA_State.HookConn = nil
+        end
+        FA_State.Hooked = false
+        Core.Log("FastAttack", "INFO", "TẮT")
+    end
+end
+
+function FastAttack.GetState()
+    return { Enabled = FA_State.Enabled, Hooked = FA_State.Hooked, AttackCount = FA_State.AttackCount }
+end
+
+LP.CharacterAdded:Connect(function()
+    task.wait(2)
+    if FA_State.Enabled then
+        FA_State.Upvalues = nil
+        FA_State.Hooked = false
+        FA_ensureHooked()
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 2 — Farm
+-- ══════════════════════════════════════════════════════════════════════════
+local Farm = {}
+local Farm_Config = { Range = 300, AttackInterval = 0.05, CacheTTL = 0.4, DeadDelay = 1.2 }
+local Farm_State = { Enabled = false, Target = nil, CacheAt = 0, KillCount = 0 }
+
+local function Farm_getChar()
+    local c = LP.Character
+    if not c then return end
+    local r = c:FindFirstChild("HumanoidRootPart")
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if r and h and h.Health > 0 then return c, r, h end
+end
+
+local function Farm_findTarget(root)
+    local best, bd = nil, Farm_Config.Range
+    local containers = { workspace:FindFirstChild("Enemies"), workspace }
+    for _, c in ipairs(containers) do
+        if c then
+            for _, m in ipairs(c:GetChildren()) do
+                if m:IsA("Model") and m ~= LP.Character then
+                    local h = m:FindFirstChildOfClass("Humanoid")
+                    local r = m:FindFirstChild("HumanoidRootPart")
+                    if h and h.Health > 0 and r then
+                        local d = (r.Position - root.Position).Magnitude
+                        if d < bd then best, bd = m, d end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function Farm_attack(char, target)
+    local th = target and target:FindFirstChild("HumanoidRootPart")
+    if API.HumanizedAttack then
+        API.HumanizedAttack()
+    else
+        local tool = char:FindFirstChildOfClass("Tool")
+        if tool then pcall(function() tool:Activate() end) end
+    end
+end
+
+local function Farm_loop()
+    while Farm_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local char, root, hum = Farm_getChar()
+            if not char then task.wait(1); return end
+            if hum.PlatformStand then hum.PlatformStand = false end
+
+            local now = tick()
+            if not Farm_State.Target or not Farm_State.Target.Parent
+               or (now - Farm_State.CacheAt) > Farm_Config.CacheTTL then
+                Farm_State.Target = Farm_findTarget(root)
+                Farm_State.CacheAt = now
+            end
+
+            local target = Farm_State.Target
+            if target then
+                local tr = target:FindFirstChild("HumanoidRootPart")
+                if tr then
+                    tr.CFrame = CFrame.new(root.Position + root.CFrame.LookVector * 4)
+                    tr.AssemblyLinearVelocity = Vector3.zero
+                end
+                local tool = char:FindFirstChildOfClass("Tool")
+                if not tool then
+                    local bp = LP:FindFirstChild("Backpack")
+                    if bp and hum then
+                        for _, t in ipairs(bp:GetChildren()) do
+                            if t:IsA("Tool") then
+                                pcall(function() hum:EquipTool(t) end)
+                                break
+                            end
+                        end
+                    end
+                end
+                Farm_attack(char, target)
+                local th = target:FindFirstChildOfClass("Humanoid")
+                if th and th.Health <= 0 then
+                    Farm_State.KillCount = Farm_State.KillCount + 1
+                    Core.Emit("Farm:Kill", { target = target.Name })
+                    Farm_State.Target = nil
+                    task.wait(Farm_Config.DeadDelay)
+                end
+            end
+        end)
+        task.wait(Farm_Config.AttackInterval)
+    end
+end
+
+function Farm.Toggle(on)
+    if on == Farm_State.Enabled then return end
+    Farm_State.Enabled = on
+    if on then
+        API.EnsureCombatHook()
+        Core.StartModule("Farm", Farm_loop)
+        Core.Log("Farm", "INFO", "BẬT")
+    else
+        Core.StopModule("Farm")
+        Farm_State.Target = nil
+        Core.Log("Farm", "INFO", "TẮT — kills="..Farm_State.KillCount)
+    end
+end
+
+function Farm.SetRange(v)
+    local n = tonumber(v)
+    if n then Farm_Config.Range = math.clamp(n, 50, 1000) end
+end
+
+function Farm.GetState()
+    return { Enabled = Farm_State.Enabled, KillCount = Farm_State.KillCount }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 3 — ESP
+-- ══════════════════════════════════════════════════════════════════════════
+local ESP = {}
+local ESP_Config = { UpdateInterval = 0.1, MaxDistance = 5000 }
+local ESP_State = { Enabled = false, Filters = { Player = false, Boss = false, Fruit = false, Chest = false }, Pool = {} }
+local DrawingNew = Drawing and Drawing.new or (getgenv().Drawing and getgenv().Drawing.new)
+
+local function ESP_isAlive(obj)
+    if not obj or not obj.Parent then return false end
+    local hrp = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
+    if not hrp then return false end
+    local hum = obj:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return false end
+    return true, hrp
+end
+
+local function ESP_release(obj)
+    local e = ESP_State.Pool[obj]
+    if not e then return end
+    pcall(function() if e.box then e.box:Remove() end end)
+    pcall(function() if e.name then e.name:Remove() end end)
+    ESP_State.Pool[obj] = nil
+end
+
+local function ESP_clear()
+    for obj in pairs(ESP_State.Pool) do ESP_release(obj) end
+    ESP_State.Pool = {}
+end
+
+local function ESP_acquire(obj, kind)
+    local e = ESP_State.Pool[obj]
+    if e then return e end
+    local color = Color3.fromRGB(255, 80, 80)
+    if kind == "Boss" then color = Color3.fromRGB(255, 255, 0)
+    elseif kind == "Fruit" then color = Color3.fromRGB(0, 255, 120)
+    elseif kind == "Chest" then color = Color3.fromRGB(150, 100, 255) end
+    e = { box = DrawingNew("Square"), name = DrawingNew("Text") }
+    e.box.Visible = false
+    e.box.Color = color
+    e.box.Thickness = 1
+    e.name.Visible = false
+    e.name.Color = color
+    e.name.Size = 14
+    e.name.Center = true
+    e.name.Outline = true
+    ESP_State.Pool[obj] = e
+    return e
+end
+
+local function ESP_renderOne(cam, obj, kind)
+    local alive, hrp = ESP_isAlive(obj)
+    if not alive then ESP_release(obj); return end
+    local e = ESP_acquire(obj, kind)
+    local dist = (cam.CFrame.Position - hrp.Position).Magnitude
+    if dist > ESP_Config.MaxDistance then
+        e.box.Visible = false; e.name.Visible = false; return
+    end
+    local pos, onScreen = cam:WorldToViewportPoint(hrp.Position)
+    if not onScreen then
+        e.box.Visible = false; e.name.Visible = false; return
+    end
+    local size = 1000 / math.max(dist, 1)
+    e.box.Size = Vector2.new(size, size * 1.5)
+    e.box.Position = Vector2.new(pos.X - size/2, pos.Y - size*0.75)
+    e.box.Visible = true
+    e.name.Text = string.format("%s [%dm]", obj.Name, math.floor(dist))
+    e.name.Position = Vector2.new(pos.X, pos.Y - size*0.9)
+    e.name.Visible = true
+end
+
+local function ESP_loop()
+    while ESP_State.Enabled and Core.State.Status ~= "UNLOADED" do
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            if not cam then return end
+            local candidates = {}
+            if ESP_State.Filters.Player then
+                for _, p in ipairs(Services.Players:GetPlayers()) do
+                    if p ~= LP and p.Character then
+                        table.insert(candidates, { obj = p.Character, kind = "Player" })
+                    end
+                end
+            end
+            if ESP_State.Filters.Boss then
+                for _, m in ipairs(workspace:GetChildren()) do
+                    if m:IsA("Model") and API.IsBossName(m.Name) then
+                        table.insert(candidates, { obj = m, kind = "Boss" })
+                    end
+                end
+            end
+            if ESP_State.Filters.Fruit then
+                for _, f in ipairs(API.ScanFruits()) do
+                    table.insert(candidates, { obj = f.obj, kind = "Fruit" })
+                end
+            end
+            if ESP_State.Filters.Chest then
+                for _, c in ipairs(API.ScanChests()) do
+                    table.insert(candidates, { obj = c.obj, kind = "Chest" })
+                end
+            end
+            for _, c in ipairs(candidates) do
+                ESP_renderOne(cam, c.obj, c.kind)
+            end
+        end)
+        task.wait(ESP_Config.UpdateInterval)
+    end
+end
+
+function ESP.Toggle(on)
+    if on == ESP_State.Enabled then return end
+    if on and not DrawingNew then
+        Core.Log("ESP", "ERROR", "Drawing API unavailable")
+        return
+    end
+    ESP_State.Enabled = on
+    if on then
+        Core.StartModule("ESP", ESP_loop)
+        Core.Log("ESP", "INFO", "BẬT")
+    else
+        Core.StopModule("ESP")
+        ESP_clear()
+        Core.Log("ESP", "INFO", "TẮT")
+    end
+end
+
+function ESP.SetFilter(kind, on)
+    if ESP_State.Filters[kind] ~= nil then ESP_State.Filters[kind] = on end
+end
+
+function ESP.GetState()
+    local count = 0
+    for _ in pairs(ESP_State.Pool) do count = count + 1 end
+    return { Enabled = ESP_State.Enabled, Filters = ESP_State.Filters, BoxCount = count }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 4 — Boss
+-- ══════════════════════════════════════════════════════════════════════════
+local Boss = {}
+local Boss_Config = { TPRange = 800, AttackRange = 300, SpawnCheck = 1.5 }
+local Boss_State = { Enabled = false, ActiveBoss = nil, SpawnPos = nil, KillCount = 0, CacheTarget = nil, CacheAt = 0 }
+
+local BossSpawns = {
+    ["Rip Indra"]    = Vector3.new(62440, 16, 2380),
+    ["Cake Prince"]  = Vector3.new(63820, 120, 4310),
+    ["Longma"]       = Vector3.new(66720, 350, 1480),
+    ["Golem"]        = Vector3.new(62310, 905, -1190),
+    ["Draco"]        = Vector3.new(62340, 910, -1210),
+    ["Elite Hunter"] = Vector3.new(59430, 16, 1830),
+    ["Soul Reaper"]  = Vector3.new(60050, 16, 1740),
+    ["Greybeard"]    = Vector3.new(59310, 16, 5550),
+    ["Katakuri"]     = Vector3.new(63820, 120, 4310),
+}
+
+local function Boss_getChar()
+    local c = LP.Character
+    if not c then return end
+    local r = c:FindFirstChild("HumanoidRootPart")
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if r and h and h.Health > 0 then return c, r, h end
+end
+
+local function Boss_findBoss(name)
+    local n = name:lower()
+    for _, m in ipairs(workspace:GetChildren()) do
+        if m:IsA("Model") and m.Name:lower():find(n) then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then return m end
+        end
+    end
+end
+
+local function Boss_loop()
+    while Boss_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local char, root, hum = Boss_getChar()
+            if not root then task.wait(1); return end
+            local boss = Boss_findBoss(Boss_State.ActiveBoss)
+            if not boss then
+                if Boss_State.SpawnPos then
+                    local dist = (root.Position - Boss_State.SpawnPos).Magnitude
+                    if dist > Boss_Config.TPRange then
+                        pcall(function()
+                            root.CFrame = CFrame.new(Boss_State.SpawnPos + Vector3.new(0, 4, 0))
+                        end)
+                    end
+                end
+                task.wait(Boss_Config.SpawnCheck)
+                return
+            end
+            local tr = boss:FindFirstChild("HumanoidRootPart") or boss.PrimaryPart
+            if not tr then task.wait(0.5); return end
+            local dist = (root.Position - tr.Position).Magnitude
+            if dist > Boss_Config.TPRange then
+                pcall(function()
+                    root.CFrame = CFrame.new(tr.Position + Vector3.new(0, 5, 0))
+                end)
+            else
+                pcall(function()
+                    root.CFrame = CFrame.lookAt(tr.Position + Vector3.new(0, 5, 0), tr.Position)
+                end)
+                local tool = char:FindFirstChildOfClass("Tool")
+                if tool then pcall(function() tool:Activate() end) end
+            end
+            local bh = boss:FindFirstChildOfClass("Humanoid")
+            if bh and bh.Health <= 0 then
+                Boss_State.KillCount = Boss_State.KillCount + 1
+                Core.Emit("Boss:Kill", { name = Boss_State.ActiveBoss })
+                Boss_State.CacheTarget = nil
+            end
+        end)
+        task.wait(0.15)
+    end
+end
+
+function Boss.Toggle(bossName, on)
+    if not BossSpawns[bossName] then
+        Core.Log("Boss", "WARN", "unknown boss: "..tostring(bossName))
+        return
+    end
+    if on then
+        Boss_State.ActiveBoss = bossName
+        Boss_State.SpawnPos = BossSpawns[bossName]
+        Boss_State.Enabled = true
+        Core.StartModule("Boss", Boss_loop)
+        Core.Log("Boss", "INFO", "BẬT: "..bossName)
+    else
+        Boss_State.Enabled = false
+        Boss_State.ActiveBoss = nil
+        Core.StopModule("Boss")
+        Core.Log("Boss", "INFO", "TẮT")
+    end
+end
+
+function Boss.GetState()
+    return { Enabled = Boss_State.Enabled, ActiveBoss = Boss_State.ActiveBoss, KillCount = Boss_State.KillCount }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 5 — Movement
+-- ══════════════════════════════════════════════════════════════════════════
+local Movement = {}
+local Move_Config = { DefaultWalkSpeed = 16, DefaultJumpPower = 50, MaxWalkSpeed = 500, MaxJumpPower = 500 }
+local Move_State = { WalkSpeed = 16, JumpPower = 50, Noclip = false, InfJump = false, WalkWater = false }
+
+local function Move_getHum()
+    local c = LP.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function Move_applySpeed(v)
+    local h = Move_getHum()
+    if h and h.WalkSpeed ~= v then h.WalkSpeed = v end
+end
+
+local function Move_applyJump(v)
+    local h = Move_getHum()
+    if h then
+        if not h.UseJumpPower then h.UseJumpPower = true end
+        if h.JumpPower ~= v then h.JumpPower = v end
+    end
+end
+
+function Movement.SetSpeed(v)
+    Move_State.WalkSpeed = math.clamp(tonumber(v) or 16, 16, Move_Config.MaxWalkSpeed)
+    Move_applySpeed(Move_State.WalkSpeed)
+end
+
+function Movement.SetJump(v)
+    Move_State.JumpPower = math.clamp(tonumber(v) or 50, 50, Move_Config.MaxJumpPower)
+    Move_applyJump(Move_State.JumpPower)
+end
+
+function Movement.ToggleNoclip(on)
+    Move_State.Noclip = on
+    if on then
+        Core.StartModule("Noclip", function()
+            while Move_State.Noclip and Core.State.Status ~= "UNLOADED" do
+                local char = LP.Character
+                if char then
+                    for _, v in ipairs(char:GetDescendants()) do
+                        if v:IsA("BasePart") then v.CanCollide = false end
+                    end
+                end
+                task.wait(0.2)
+            end
+        end)
+    else
+        Core.StopModule("Noclip")
+    end
+    Core.Log("Movement", "INFO", "Noclip "..(on and "BẬT" or "TẮT"))
+end
+
+function Movement.ToggleInfJump(on)
+    Move_State.InfJump = on
+    if on then
+        Services.UserInputService.JumpRequest:Connect(function()
+            if Move_State.InfJump then
+                local h = Move_getHum()
+                if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+            end
+        end)
+    end
+    Core.Log("Movement", "INFO", "InfJump "..(on and "BẬT" or "TẮT"))
+end
+
+function Movement.ToggleWalkWater(on)
+    Move_State.WalkWater = on
+    if on then
+        Core.StartModule("WalkWater", function()
+            while Move_State.WalkWater and Core.State.Status ~= "UNLOADED" do
+                for _, v in ipairs(workspace:GetDescendants()) do
+                    if v:IsA("BasePart") and v.Name == "Water" then
+                        v.CanCollide = true
+                    end
+                end
+                task.wait(1)
+            end
+        end)
+    else
+        Core.StopModule("WalkWater")
+    end
+    Core.Log("Movement", "INFO", "WalkWater "..(on and "BẬT" or "TẮT"))
+end
+
+function Movement.GetState()
+    return { WalkSpeed = Move_State.WalkSpeed, JumpPower = Move_State.JumpPower, Noclip = Move_State.Noclip, InfJump = Move_State.InfJump }
+end
+
+LP.CharacterAdded:Connect(function()
+    task.wait(1)
+    Move_applySpeed(Move_State.WalkSpeed)
+    Move_applyJump(Move_State.JumpPower)
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 6 — FruitSniper
+-- ══════════════════════════════════════════════════════════════════════════
+local FruitSniper = {}
+local Sniper_Config = { MaxRange = 3000, ScanTTL = 0.8, TweenMax = 1.2, PickupWait = 0.4 }
+local Sniper_State = { Enabled = false, Seen = {}, Count = 0, CacheAt = 0, List = {} }
+
+local function Sniper_getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function Sniper_scan()
+    local now = tick()
+    if now - Sniper_State.CacheAt < Sniper_Config.ScanTTL then return Sniper_State.List end
+    Sniper_State.List = API.ScanFruits(Sniper_Config.MaxRange)
+    Sniper_State.CacheAt = now
+    return Sniper_State.List
+end
+
+local function Sniper_pickup(root, entry)
+    local dist = (entry.handle.Position - root.Position).Magnitude
+    if dist < 3 then return end
+    local dur = math.clamp(dist / 1500, 0.1, Sniper_Config.TweenMax)
+    local tw = Services.TweenService:Create(
+        root, TweenInfo.new(dur, Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(entry.handle.Position + Vector3.new(0, 3, 0)) }
+    )
+    tw:Play()
+    tw.Completed:Wait()
+    local pp = entry.obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if pp and fireproximityprompt then
+        pcall(fireproximityprompt, pp)
+    end
+    task.wait(Sniper_Config.PickupWait)
+end
+
+local function Sniper_loop()
+    while Sniper_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local root = Sniper_getRoot()
+            if not root then task.wait(1); return end
+            for _, entry in ipairs(Sniper_scan()) do
+                if not Sniper_State.Enabled then break end
+                if not Sniper_State.Seen[entry.obj] then
+                    Sniper_State.Seen[entry.obj] = true
+                    Core.Log("FruitSniper", "INFO", "fruit found: "..entry.name)
+                    Sniper_pickup(root, entry)
+                    Sniper_State.Count = Sniper_State.Count + 1
+                    Core.Emit("FruitSniper:Picked", { name = entry.name })
+                end
+            end
+        end)
+        task.wait(Sniper_Config.ScanTTL)
+    end
+end
+
+function FruitSniper.Toggle(on)
+    if on == Sniper_State.Enabled then return end
+    Sniper_State.Enabled = on
+    if on then
+        Core.StartModule("FruitSniper", Sniper_loop)
+        Core.Log("FruitSniper", "INFO", "BẬT")
+    else
+        Core.StopModule("FruitSniper")
+        Core.Log("FruitSniper", "INFO", "TẮT — picked="..Sniper_State.Count)
+    end
+end
+
+function FruitSniper.SetRange(v)
+    local n = tonumber(v)
+    if n then Sniper_Config.MaxRange = math.clamp(n, 500, 5000) end
+end
+
+function FruitSniper.GetState()
+    return { Enabled = Sniper_State.Enabled, Count = Sniper_State.Count }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 7 — AutoBuy
+-- ══════════════════════════════════════════════════════════════════════════
+local AutoBuy = {}
+local Buy_Config = { Interval = 2.0, Flags = { Haki=true, Geppo=true, Soru=true, Sword=false, Gun=false, Fruit=false } }
+local Buy_State = { Enabled = false, Count = 0 }
+
+local function Buy_loop()
+    while Buy_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            if Buy_Config.Flags.Haki  then API.BuyHaki("Buso") end
+            if Buy_Config.Flags.Geppo then API.BuyGeppo() end
+            if Buy_Config.Flags.Soru  then API.BuySoru() end
+            if Buy_Config.Flags.Sword then API.BuySword("Sword") end
+            if Buy_Config.Flags.Gun   then API.BuyGun("Slingshot") end
+            if Buy_Config.Flags.Fruit then API.BuyFruit("Random") end
+            Buy_State.Count = Buy_State.Count + 1
+        end)
+        task.wait(Buy_Config.Interval)
+    end
+end
+
+function AutoBuy.Toggle(on)
+    if on == Buy_State.Enabled then return end
+    Buy_State.Enabled = on
+    if on then Core.StartModule("AutoBuy", Buy_loop)
+    else Core.StopModule("AutoBuy") end
+    Core.Log("AutoBuy", "INFO", on and "BẬT" or "TẮT")
+end
+
+function AutoBuy.SetFlag(flag, on)
+    if Buy_Config.Flags[flag] ~= nil then Buy_Config.Flags[flag] = on and true or false end
+end
+
+function AutoBuy.GetState()
+    return { Enabled = Buy_State.Enabled, Count = Buy_State.Count, Flags = Buy_Config.Flags }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 8 — Hop
+-- ══════════════════════════════════════════════════════════════════════════
+local Hop = {}
+local Hop_Config = { MaxPages = 3, PageSize = 100, AutoHopInterval = 3, ReconnectDelay = 1.5 }
+local Hop_State = { AutoHop = false, Reconnect = true, HopCount = 0, KickDetected = 0, KickHook = nil }
+
+local function Hop_safeRejoin()
+    return pcall(function()
+        Services.TeleportService:Teleport(game.PlaceId, LP)
+    end)
+end
+
+local function Hop_installKickHook()
+    pcall(function()
+        local oldNC
+        oldNC = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if not checkcaller() and method == "Kick" then
+                Hop_State.KickDetected = Hop_State.KickDetected + 1
+                Core.Log("Hop", "WARN", "kick intercepted ("..Hop_State.KickDetected..")")
+                if Hop_State.Reconnect then
+                    task.spawn(function()
+                        task.wait(Hop_Config.ReconnectDelay)
+                        if not Hop_safeRejoin() then
+                            Core.Log("Hop", "ERROR", "rejoin failed")
+                            Hop.Hop()
+                        end
+                    end)
+                end
+                return
+            end
+            return oldNC(self, ...)
+        end)
+        Hop_State.KickHook = oldNC
+    end)
+end
+Hop_installKickHook()
+
+local function Hop_serverHop()
+    local cursor = ""
+    local page = 0
+    while page < Hop_Config.MaxPages do
+        page = page + 1
+        local url = string.format(
+            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=%d",
+            game.PlaceId, Hop_Config.PageSize
+        )
+        if cursor ~= "" then url = url.."&cursor="..cursor end
+        local ok, res = pcall(function() return game:HttpGet(url) end)
+        if not ok or not res then
+            Core.Log("Hop", "ERROR", "HTTP failed")
+            return false
+        end
+        local ok2, data = pcall(function() return Services.HttpService:JSONDecode(res) end)
+        if not ok2 or not data or not data.data then
+            Core.Log("Hop", "ERROR", "decode failed")
+            return false
+        end
+        for _, s in ipairs(data.data) do
+            if s.id ~= game.JobId and s.playing < (s.maxPlayers - 1) then
+                Hop_State.HopCount = Hop_State.HopCount + 1
+                Core.Log("Hop", "INFO", "hopping to "..s.id)
+                pcall(function()
+                    Services.TeleportService:TeleportToPlaceInstance(
+                        game.PlaceId, s.id, LP
+                    )
+                end)
+                return true
+            end
+        end
+        cursor = data.nextPageCursor or ""
+        if cursor == "" then break end
+    end
+    Core.Log("Hop", "WARN", "no usable server")
+    return false
+end
+
+function Hop.Hop() return Hop_serverHop() end
+
+function Hop.Rejoin()
+    Core.Log("Hop", "INFO", "rejoin requested")
+    return Hop_safeRejoin()
+end
+
+function Hop.ToggleAutoHop(on)
+    if on == Hop_State.AutoHop then return end
+    Hop_State.AutoHop = on
+    if on then
+        Core.StartModule("AutoHop", function()
+            while Hop_State.AutoHop and Core.State.Status ~= "UNLOADED" do
+                pcall(function()
+                    local char = LP.Character
+                    local root = char and char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        for _, p in ipairs(Services.Players:GetPlayers()) do
+                            if p ~= LP and p.Character then
+                                local pr = p.Character:FindFirstChild("HumanoidRootPart")
+                                if pr and (pr.Position - root.Position).Magnitude < 25 then
+                                    Core.Log("Hop", "INFO", "player nearby, hopping")
+                                    Hop_serverHop()
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end)
+                task.wait(Hop_Config.AutoHopInterval)
+            end
+        end)
+    else
+        Core.StopModule("AutoHop")
+    end
+    Core.Log("Hop", "INFO", "AutoHop "..(on and "BẬT" or "TẮT"))
+end
+
+function Hop.SetReconnect(on)
+    Hop_State.Reconnect = on
+    Core.Log("Hop", "INFO", "Reconnect "..(on and "BẬT" or "TẮT"))
+end
+
+function Hop.GetState()
+    return { AutoHop = Hop_State.AutoHop, Reconnect = Hop_State.Reconnect, HopCount = Hop_State.HopCount, KickDetected = Hop_State.KickDetected }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 9 — Fishing
+-- ══════════════════════════════════════════════════════════════════════════
+local Fishing = {}
+local Fish_Config = { CastWaitMin = 2.5, CastWaitMax = 3.5, ReelWait = 1.2, RetryDelay = 1.5, RodNameHints = { "Rod", "FishingRod", "FishRod" } }
+local Fish_State = { Enabled = false, Casts = 0, Catches = 0 }
+
+local function Fish_getChar()
+    local c = LP.Character
+    if not c then return end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if h and h.Health > 0 then return c, h end
+end
+
+local function Fish_findRod(char)
+    for _, hint in ipairs(Fish_Config.RodNameHints) do
+        local t = char:FindFirstChild(hint)
+        if t and t:IsA("Tool") then return t end
+    end
+    for _, t in ipairs(char:GetChildren()) do
+        if t:IsA("Tool") and (t.Name:find("Rod") or t.Name:find("Fish")) then
+            return t
+        end
+    end
+    return nil
+end
+
+local function Fish_equipRod(char, hum)
+    local bp = LP:FindFirstChild("Backpack")
+    if not bp or not hum then return nil end
+    for _, t in ipairs(bp:GetChildren()) do
+        if t:IsA("Tool") and (t.Name:find("Rod") or t.Name:find("Fish")) then
+            pcall(function() hum:EquipTool(t) end)
+            task.wait(0.3)
+            return Fish_findRod(char)
+        end
+    end
+    return nil
+end
+
+local function Fish_loop()
+    while Fish_State.Enabled and Core.State.Status == "RUNNING" do
+        local char, hum = Fish_getChar()
+        if not char then task.wait(1); return end
+        local rod = Fish_findRod(char) or Fish_equipRod(char, hum)
+        if not rod then task.wait(2); return end
+        local ok = pcall(function() rod:Activate() end)
+        if ok then
+            Fish_State.Casts = Fish_State.Casts + 1
+            task.wait(math.random(Fish_Config.CastWaitMin*10, Fish_Config.CastWaitMax*10)/10)
+            local pp = rod:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if pp and fireproximityprompt then
+                pcall(fireproximityprompt, pp)
+                Fish_State.Catches = Fish_State.Catches + 1
+            else
+                pcall(function() rod:Activate() end)
+            end
+            task.wait(Fish_Config.ReelWait)
+        else
+            task.wait(Fish_Config.RetryDelay)
+        end
+    end
+end
+
+function Fishing.Toggle(on)
+    if on == Fish_State.Enabled then return end
+    Fish_State.Enabled = on
+    if on then Core.StartModule("Fishing", Fish_loop)
+    else Core.StopModule("Fishing") end
+    Core.Log("Fishing", "INFO", on and "BẬT" or "TẮT")
+end
+
+function Fishing.GetState()
+    return { Enabled = Fish_State.Enabled, Casts = Fish_State.Casts, Catches = Fish_State.Catches }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 10 — AutoPickup
+-- ══════════════════════════════════════════════════════════════════════════
+local AutoPickup = {}
+local Pickup_Config = { Range = 600, ScanTTL = 0.8, TweenMax = 1.5, PickupWait = 0.3, Categories = { Chest = true, Fruit = true, Drop = true } }
+local Pickup_State = { Enabled = false, Seen = {}, CacheAt = 0, List = {}, Count = { Chest = 0, Fruit = 0, Drop = 0 } }
+
+local function Pickup_getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function Pickup_scanAll()
+    local now = tick()
+    if now - Pickup_State.CacheAt < Pickup_Config.ScanTTL then return Pickup_State.List end
+    local list = {}
+    if Pickup_Config.Categories.Chest then
+        for _, c in ipairs(API.ScanChests(Pickup_Config.Range)) do
+            c.kind = "Chest"
+            table.insert(list, c)
+        end
+    end
+    if Pickup_Config.Categories.Fruit then
+        for _, f in ipairs(API.ScanFruits(Pickup_Config.Range)) do
+            f.part = f.handle
+            f.kind = "Fruit"
+            table.insert(list, f)
+        end
+    end
+    if Pickup_Config.Categories.Drop then
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj:IsA("Tool") and obj:FindFirstChild("Handle") then
+                table.insert(list, { obj = obj, part = obj.Handle, kind = "Drop", name = obj.Name })
+            end
+        end
+    end
+    Pickup_State.CacheAt = now
+    Pickup_State.List = list
+    return list
+end
+
+local function Pickup_pickup(root, entry)
+    local part = entry.part or entry.handle
+    if not part then return end
+    local dist = (part.Position - root.Position).Magnitude
+    if dist < 3 then return end
+    local dur = math.clamp(dist / 1500, 0.1, Pickup_Config.TweenMax)
+    local tw = Services.TweenService:Create(
+        root, TweenInfo.new(dur, Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0)) }
+    )
+    tw:Play()
+    tw.Completed:Wait()
+    local pp = entry.obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if pp and fireproximityprompt then
+        pcall(fireproximityprompt, pp)
+    elseif entry.obj:IsA("Tool") then
+        pcall(function() entry.obj:Activate() end)
+    end
+    task.wait(Pickup_Config.PickupWait)
+end
+
+local function Pickup_loop()
+    while Pickup_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local root = Pickup_getRoot()
+            if not root then task.wait(1); return end
+            for _, entry in ipairs(Pickup_scanAll()) do
+                if not Pickup_State.Enabled then break end
+                if not Pickup_State.Seen[entry.obj] then
+                    Pickup_State.Seen[entry.obj] = true
+                    Pickup_pickup(root, entry)
+                    Pickup_State.Count[entry.kind] = (Pickup_State.Count[entry.kind] or 0) + 1
+                    Core.Log("AutoPickup", "INFO", "picked "..entry.kind..": "..tostring(entry.name))
+                    Core.Emit("AutoPickup:Picked", entry)
+                end
+            end
+        end)
+        task.wait(Pickup_Config.ScanTTL)
+    end
+end
+
+function AutoPickup.Toggle(on)
+    if on == Pickup_State.Enabled then return end
+    Pickup_State.Enabled = on
+    if on then Core.StartModule("AutoPickup", Pickup_loop)
+    else Core.StopModule("AutoPickup") end
+    Core.Log("AutoPickup", "INFO", on and "BẬT" or "TẮT")
+end
+
+function AutoPickup.SetCategory(cat, on)
+    if Pickup_Config.Categories[cat] ~= nil then Pickup_Config.Categories[cat] = on end
+end
+
+function AutoPickup.SetRange(v)
+    local n = tonumber(v)
+    if n then Pickup_Config.Range = math.clamp(n, 100, 2000) end
+end
+
+function AutoPickup.GetState()
+    return { Enabled = Pickup_State.Enabled, Count = Pickup_State.Count }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 11 — UIToggle
+-- ══════════════════════════════════════════════════════════════════════════
+local UIToggle = {}
+local UIT_Config = {
+    ButtonSize = 50,
+    ButtonPos = UDim2.new(0.9, 0, 0.1, 0),
+    TweenTime = 0.2,
+    Hotkey = Enum.KeyCode.RightShift,
+    Colors = {
+        OpenBg = Color3.fromRGB(80, 100, 255),
+        ClosedBg = Color3.fromRGB(40, 40, 55),
+        OpenStroke = Color3.fromRGB(120, 140, 255),
+        ClosedStroke = Color3.fromRGB(90, 90, 110),
+    },
+    Text = { Open = "O", Closed = "—" },
+}
+local UIT_State = { Gui = nil, Btn = nil, Stroke = nil, Window = nil, Open = true, HotkeyConn = nil, ClickConn = nil, ToggleCount = 0 }
+
+local function UIT_resolveParent()
+    local p
+    pcall(function() p = game:GetService("CoreGui") end)
+    if p then return p end
+    return LP:WaitForChild("PlayerGui")
+end
+
+local function UIT_applyVisual(open)
+    if not UIT_State.Btn or not UIT_State.Stroke then return end
+    local c = UIT_Config.Colors
+    Services.TweenService:Create(UIT_State.Btn, TweenInfo.new(UIT_Config.TweenTime), {
+        BackgroundColor3 = open and c.OpenBg or c.ClosedBg,
+    }):Play()
+    Services.TweenService:Create(UIT_State.Stroke, TweenInfo.new(UIT_Config.TweenTime), {
+        Color = open and c.OpenStroke or c.ClosedStroke,
+    }):Play()
+    UIT_State.Btn.Text = open and UIT_Config.Text.Open or UIT_Config.Text.Closed
+end
+
+local function UIT_toggle(forceState)
+    local target = forceState
+    if target == nil then target = not UIT_State.Open end
+    if target == UIT_State.Open then return end
+    UIT_State.Open = target
+    UIT_State.ToggleCount = UIT_State.ToggleCount + 1
+    if UIT_State.Window then
+        pcall(function()
+            if target then UIT_State.Window:Open() else UIT_State.Window:Close() end
+        end)
+        UIT_applyVisual(target)
+        Core.Log("UIToggle", "INFO", target and "UI mở" or "UI đóng")
+        Core.Emit(target and "UIToggle:Open" or "UIToggle:Close")
+    end
+end
+
+local function UIT_destroy()
+    if UIT_State.HotkeyConn then pcall(function() UIT_State.HotkeyConn:Disconnect() end); UIT_State.HotkeyConn = nil end
+    if UIT_State.ClickConn then pcall(function() UIT_State.ClickConn:Disconnect() end); UIT_State.ClickConn = nil end
+    if UIT_State.Gui then pcall(function() UIT_State.Gui:Destroy() end); UIT_State.Gui = nil end
+    UIT_State.Btn = nil
+    UIT_State.Stroke = nil
+end
+
+local function UIT_build(windowRef)
+    if UIT_State.Gui and UIT_State.Gui.Parent then return true end
+    UIT_State.Window = windowRef
+    local parent = UIT_resolveParent()
+    local existing = parent:FindFirstChild("ZT_Toggle")
+    if existing then pcall(function() existing:Destroy() end) end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ZT_Toggle"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 1000
+    gui.IgnoreGuiInset = true
+    gui.Parent = parent
+
+    local btn = Instance.new("TextButton", gui)
+    btn.Size = UDim2.fromOffset(UIT_Config.ButtonSize, UIT_Config.ButtonSize)
+    btn.Position = UIT_Config.ButtonPos
+    btn.BackgroundColor3 = UIT_Config.Colors.OpenBg
+    btn.Text = UIT_Config.Text.Open
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 26
+    btn.Font = Enum.Font.GothamBold
+    btn.AutoButtonColor = false
+    btn.Active = true
+    btn.Draggable = true
+    btn.BorderSizePixel = 0
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Color = UIT_Config.Colors.OpenStroke
+    stroke.Thickness = 2
+
+    UIT_State.Gui = gui
+    UIT_State.Btn = btn
+    UIT_State.Stroke = stroke
+
+    UIT_State.ClickConn = btn.MouseButton1Click:Connect(function()
+        UIT_toggle(nil)
+    end)
+
+    UIT_State.HotkeyConn = Services.UserInputService.InputBegan:Connect(function(input, gp)
+        if input.KeyCode ~= UIT_Config.Hotkey then return end
+        if gp then return end
+        if Services.UserInputService:GetFocusedTextBox() then return end
+        UIT_toggle(nil)
+    end)
+    return true
+end
+
+function UIToggle.Build(windowRef) return UIT_build(windowRef) end
+function UIToggle.Toggle(forceState) UIT_toggle(forceState) end
+function UIToggle.Open() UIT_toggle(true) end
+function UIToggle.Close() UIT_toggle(false) end
+function UIToggle.GetState()
+    return { Open = UIT_State.Open, ToggleCount = UIT_State.ToggleCount }
+end
+
+Core.On("Core:Unload", function() UIT_destroy() end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 12 — AntiDetection
+-- ══════════════════════════════════════════════════════════════════════════
+local AntiDetection = {}
+local AD_Config = {
+    ClickDelay = 0.2,
+    RandomYTween = false,
+    RandomYRange = { min = -3, max = 6 },
+    RandomPosition = false,
+    RandomPosRadius = 12,
+    HitAndRun = true,
+    HitAndRunChance = 0.35,
+    PredictMove = true,
+    PredictMultiplier = 0.15,
+    Skills = {
+        Melee = { Enabled = true, Z = { true, 0.100, 0.165 }, X = { true, 0.300, 0.246 }, C = { true, 0.500, 0.125 } },
+        BloxFruit = { Enabled = false, Z = { true, 1.325, 0.900 }, X = { true, 0.600, 0.235 }, C = { true, 0.200, 0.435 }, V = { true, 0.300, 0.195 }, F = { true, 0.000, 0.600 } },
+        Sword = { Enabled = true, Z = { true, 0.500, 0.200 }, X = { true, 0.300, 0.400 } },
+    },
+    MaxComboLength = 4,
+    MinComboLength = 2,
+    ComboBreakChance = 0.2,
+    ComboRestMin = 1.0,
+    ComboRestMax = 3.0,
+    MaxInputHz = 15,
+}
+local AD_State = {
+    VIM = game:GetService("VirtualInputManager"),
+    Camera = workspace.CurrentCamera,
+    LastInputTime = 0,
+    InputCount = 0,
+    LastMousePos = Vector2.new(0, 0),
+    IsResting = false,
+    PredictCache = {},
+}
+
+local function AD_hasVIM()
+    return AD_State.VIM ~= nil and type(AD_State.VIM.SendMouseButtonEvent) == "function"
+end
+
+local function AD_fallbackClick()
+    local char = LP.Character
+    if char then
+        local tool = char:FindFirstChildOfClass("Tool")
+        if tool then pcall(function() tool:Activate() end) end
+    end
+end
+
+local function AD_canInput()
+    local now = tick()
+    if now - AD_State.LastInputTime < (1 / AD_Config.MaxInputHz) then return false end
+    AD_State.LastInputTime = now
+    return true
+end
+
+local function AD_click(x, y, down)
+    if not AD_hasVIM() then return AD_fallbackClick() end
+    return pcall(function()
+        AD_State.VIM:SendMouseButtonEvent(x, y, 0, down, game, 0)
+    end)
+end
+
+local function AD_key(keyCode, down)
+    if not AD_hasVIM() then return end
+    pcall(function()
+        AD_State.VIM:SendKeyEvent(down, keyCode, false, game)
+    end)
+end
+
+local function AD_gaussian(min, max)
+    local mean = (min + max) / 2
+    local stddev = (max - min) / 4
+    local u1, u2 = math.random(), math.random()
+    local z = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
+    return math.clamp(mean + z * stddev, min, max)
+end
+
+local function AD_getPredictedPos(hrp)
+    if not hrp then return nil end
+    local now = tick()
+    local cache = AD_State.PredictCache[hrp]
+    if cache and now - cache.time < 0.1 then return cache.pos end
+    local vel = hrp.AssemblyLinearVelocity
+    local pos = hrp.Position + vel * AD_Config.PredictMultiplier
+    AD_State.PredictCache[hrp] = { pos = pos, time = now }
+    return pos
+end
+
+local function AD_applyRandomYTween(pos)
+    if not AD_Config.RandomYTween then return pos end
+    local y = math.random(AD_Config.RandomYRange.min, AD_Config.RandomYRange.max)
+    return pos + Vector3.new(0, y, 0)
+end
+
+local function AD_applyRandomPosition(pos)
+    if not AD_Config.RandomPosition then return pos end
+    local r = AD_Config.RandomPosRadius
+    return pos + Vector3.new(math.random(-r, r), math.random(-r, r) * 0.3, math.random(-r, r))
+end
+
+local function AD_executeSkill(skillName, keyChar)
+    local table_ = AD_Config.Skills[skillName]
+    if not table_ or not table_.Enabled then return false end
+    local data = table_[keyChar]
+    if not data or not data[1] then return false end
+    local delayPress = data[2]
+    local delayRelease = data[3]
+    local keyCode = Enum.KeyCode[keyChar]
+    if not keyCode then return false end
+    AD_key(keyCode, true)
+    task.wait(delayPress)
+    AD_key(keyCode, false)
+    task.wait(delayRelease)
+    return true
+end
+
+local function AD_humanizedClick()
+    if not AD_canInput() then return false end
+    local vp = AD_State.Camera.ViewportSize
+    local cx = vp.X / 2 + math.random(-8, 8)
+    local cy = vp.Y / 2 + math.random(-8, 8)
+    AD_click(cx, cy, true)
+    task.wait(AD_gaussian(0.02, 0.06))
+    AD_click(cx, cy, false)
+    AD_State.LastMousePos = Vector2.new(cx, cy)
+    AD_State.InputCount = AD_State.InputCount + 1
+    return true
+end
+
+local function AD_humanizedCombo(attackFn, targetHrp)
+    if AD_State.IsResting then return end
+    local combo = math.random(AD_Config.MinComboLength, AD_Config.MaxComboLength)
+    local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    for i = 1, combo do
+        if not AD_canInput() then break end
+        if AD_Config.PredictMove and targetHrp then
+            local atkPos = AD_getPredictedPos(targetHrp)
+            if atkPos then
+                atkPos = AD_applyRandomYTween(atkPos)
+                atkPos = AD_applyRandomPosition(atkPos)
+            end
+        end
+        if attackFn then attackFn() else AD_humanizedClick() end
+        task.wait(AD_gaussian(AD_Config.ClickDelay * 0.5, AD_Config.ClickDelay * 1.5))
+        if math.random() < AD_Config.ComboBreakChance then
+            AD_State.IsResting = true
+            local rest = AD_gaussian(AD_Config.ComboRestMin, AD_Config.ComboRestMax)
+            task.wait(rest)
+            AD_State.IsResting = false
+            break
+        end
+    end
+    if AD_Config.HitAndRun and root and targetHrp then
+        if math.random() < AD_Config.HitAndRunChance then
+            local dir = (root.Position - targetHrp.Position).Unit
+            local fleePos = root.Position + dir * 60
+            pcall(function()
+                root.CFrame = CFrame.new(fleePos)
+            end)
+        end
+    end
+end
+
+function AntiDetection.SetClickDelay(v) AD_Config.ClickDelay = math.clamp(tonumber(v) or 0.2, 0.05, 1.0) end
+function AntiDetection.SetRandomYTween(on) AD_Config.RandomYTween = on end
+function AntiDetection.SetRandomPosition(on) AD_Config.RandomPosition = on end
+function AntiDetection.SetHitAndRun(on) AD_Config.HitAndRun = on end
+function AntiDetection.SetPredictMove(on) AD_Config.PredictMove = on end
+function AntiDetection.Click() return AD_humanizedClick() end
+function AntiDetection.Combo(attackFn, targetHrp) AD_humanizedCombo(attackFn, targetHrp) end
+function AntiDetection.Skill(skillName, keyChar) return AD_executeSkill(skillName, keyChar) end
+function AntiDetection.MouseMove(x, y) end
+function AntiDetection.GetState()
+    return {
+        InputCount = AD_State.InputCount,
+        HasVIM = AD_hasVIM(),
+        IsResting = AD_State.IsResting,
+        Config = {
+            ClickDelay = AD_Config.ClickDelay,
+            RandomYTween = AD_Config.RandomYTween,
+            RandomPosition = AD_Config.RandomPosition,
+            HitAndRun = AD_Config.HitAndRun,
+            PredictMove = AD_Config.PredictMove,
+        },
+    }
+end
+
+-- Wire into API
+API.HumanizedAttack = function()
+    return AntiDetection.Click()
+end
+API.HumanizedCombo = function(attackFn)
+    AntiDetection.Combo(attackFn)
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 13 — AutoQuest
+-- ══════════════════════════════════════════════════════════════════════════
+local AutoQuest = {}
+local Quest_Config = { TPInterval = 0.5, QuestRange = 15, CheckInterval = 2.0 }
+local QuestDB = {
+    BanditQuest1   = { npc = Vector3.new(1059, 16, 1545),  mob = Vector3.new(1090, 16, 1560) },
+    JungleQuest    = { npc = Vector3.new(-1745, 30, -296),  mob = Vector3.new(-1600, 30, -300) },
+    BuggyQuest1    = { npc = Vector3.new(-1140, 4, 3830),   mob = Vector3.new(-1100, 4, 3850) },
+    MarineQuest1   = { npc = Vector3.new(-2169, 16, -50),   mob = Vector3.new(-2200, 16, -100) },
+    FishmanQuest   = { npc = Vector3.new(2010, -109, 700),   mob = Vector3.new(2050, -109, 750) },
+    SkyExp1Quest   = { npc = Vector3.new(-1023, 910, -1315), mob = Vector3.new(-1000, 910, -1300) },
+    FountainQuest  = { npc = Vector3.new(2240, 16, -780),    mob = Vector3.new(2280, 16, -800) },
+    HauntedQuest1  = { npc = Vector3.new(-9110, 16, 4500),  mob = Vector3.new(-9150, 16, 4550) },
+    HauntedQuest2  = { npc = Vector3.new(-9110, 16, 4500),  mob = Vector3.new(-9150, 16, 4550) },
+    IceSideQuest   = { npc = Vector3.new(-8400, 206, 1220),  mob = Vector3.new(-8450, 206, 1250) },
+    PortQuest      = { npc = Vector3.new(59427, 16, 1825),  mob = Vector3.new(59450, 16, 1850) },
+    HydraQuest     = { npc = Vector3.new(61448, 16, -4098), mob = Vector3.new(61480, 16, -4050) },
+}
+local Quest_State = { Enabled = false, CurrentQuest = nil, LastCheck = 0, QuestCount = 0 }
+
+local function Quest_getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function Quest_accept(questName, questNum)
+    local db = QuestDB[questName]
+    if not db then return false end
+    local root = Quest_getRoot()
+    if not root then return false end
+    local dist = (root.Position - db.npc).Magnitude
+    if dist > Quest_Config.QuestRange then
+        pcall(function() root.CFrame = CFrame.new(db.npc + Vector3.new(0, 3, 0)) end)
+        task.wait(Quest_Config.TPInterval)
+    end
+    local ok = API.StartQuest(questName, questNum)
+    if ok then
+        Quest_State.CurrentQuest = questName
+        Quest_State.QuestCount = Quest_State.QuestCount + 1
+        Core.Log("AutoQuest", "INFO", "accepted: "..questName.." #"..tostring(questNum))
+        Core.Emit("AutoQuest:Accepted", { quest = questName, number = questNum })
+        return true
+    end
+    return false
+end
+
+local function Quest_abandon()
+    API.AbandonQuest()
+    Quest_State.CurrentQuest = nil
+    Core.Log("AutoQuest", "INFO", "abandoned current quest")
+end
+
+local function Quest_loop()
+    while Quest_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local playerGui = LP:FindFirstChild("PlayerGui")
+            local mainGui = playerGui and playerGui:FindFirstChild("Main")
+            local questFrame = mainGui and mainGui:FindFirstChild("Quest")
+            local hasQuest = questFrame and questFrame.Visible
+            if not hasQuest and Quest_State.CurrentQuest == nil then
+                local order = {
+                    "BanditQuest1", "JungleQuest", "BuggyQuest1",
+                    "MarineQuest1", "FishmanQuest", "SkyExp1Quest",
+                    "FountainQuest", "HauntedQuest1", "IceSideQuest",
+                    "PortQuest", "HydraQuest",
+                }
+                for _, qName in ipairs(order) do
+                    if Quest_accept(qName, 1) then break end
+                end
+            elseif hasQuest then
+                Quest_State.CurrentQuest = "active"
+            end
+        end)
+        task.wait(Quest_Config.CheckInterval)
+    end
+end
+
+function AutoQuest.Toggle(on)
+    if on == Quest_State.Enabled then return end
+    Quest_State.Enabled = on
+    if on then Core.StartModule("AutoQuest", Quest_loop)
+    else Core.StopModule("AutoQuest") end
+    Core.Log("AutoQuest", "INFO", on and "BẬT" or "TẮT")
+end
+
+function AutoQuest.Abandon() Quest_abandon() end
+
+function AutoQuest.GetState()
+    return { Enabled = Quest_State.Enabled, Current = Quest_State.CurrentQuest, Count = Quest_State.QuestCount }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 14 — AutoHaki
+-- ══════════════════════════════════════════════════════════════════════════
+local AutoHaki = {}
+local Haki_Config = { BusoInterval = 3.0, KenInterval = 5.0 }
+local Haki_State = { AutoBuso = false, AutoKen = false, BusoCount = 0, KenCount = 0 }
+
+local function Haki_hasBuso()
+    local char = LP.Character
+    if not char then return false end
+    return char:FindFirstChild("HasBuso") ~= nil
+end
+
+local function Haki_hasKen()
+    local char = LP.Character
+    if not char then return false end
+    return char:FindFirstChild("Ken") ~= nil or char:FindFirstChild("Observation") ~= nil
+end
+
+local function Haki_busoLoop()
+    while Core.State.Status ~= "UNLOADED" do
+        task.wait(Haki_Config.BusoInterval)
+        if not Haki_State.AutoBuso then continue end
+        pcall(function()
+            if not Haki_hasBuso() then
+                API.EnableBuso()
+                Haki_State.BusoCount = Haki_State.BusoCount + 1
+            end
+        end)
+    end
+end
+Core.StartModule("AutoHaki_Buso", Haki_busoLoop)
+
+local function Haki_kenLoop()
+    while Core.State.Status ~= "UNLOADED" do
+        task.wait(Haki_Config.KenInterval)
+        if not Haki_State.AutoKen then continue end
+        pcall(function()
+            if not Haki_hasKen() then
+                local VIM = game:GetService("VirtualInputManager")
+                if VIM then
+                    pcall(function()
+                        VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                        task.wait(0.05)
+                        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                    end)
+                    Haki_State.KenCount = Haki_State.KenCount + 1
+                end
+            end
+        end)
+    end
+end
+Core.StartModule("AutoHaki_Ken", Haki_kenLoop)
+
+function AutoHaki.ToggleBuso(on)
+    Haki_State.AutoBuso = on
+    Core.Log("AutoHaki", "INFO", "Auto Buso "..(on and "BẬT" or "TẮT"))
+end
+
+function AutoHaki.ToggleKen(on)
+    Haki_State.AutoKen = on
+    Core.Log("AutoHaki", "INFO", "Auto Ken "..(on and "BẬT" or "TẮT"))
+end
+
+function AutoHaki.GetState()
+    return { AutoBuso = Haki_State.AutoBuso, AutoKen = Haki_State.AutoKen, BusoCount = Haki_State.BusoCount, KenCount = Haki_State.KenCount }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 15 — AutoRaid
+-- ══════════════════════════════════════════════════════════════════════════
+local AutoRaid = {}
+local Raid_Config = { CheckInterval = 3.0, RaidMaps = { "Magma", "Flame", "Ice", "Sand", "Dark", "Light" }, RaidIslandRange = 2500 }
+local Raid_State = { Enabled = false, RaidCount = 0, CurrentMap = nil }
+
+local function Raid_getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function Raid_isActive()
+    local pg = LP:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    local hud = main and main:FindFirstChild("TopHUDList")
+    local timer = hud and hud:FindFirstChild("RaidTimer")
+    return timer and timer.Visible
+end
+
+local function Raid_findIsland()
+    local root = Raid_getRoot()
+    if not root then return nil end
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name:find("Island") and obj:IsA("BasePart") then
+            local dist = (obj.Position - root.Position).Magnitude
+            if dist < Raid_Config.RaidIslandRange then return obj end
+        end
+    end
+    return nil
+end
+
+local function Raid_start()
+    local map = Raid_Config.RaidMaps[math.random(#Raid_Config.RaidMaps)]
+    API.SelectRaid(map)
+    Raid_State.CurrentMap = map
+    Raid_State.RaidCount = Raid_State.RaidCount + 1
+    Core.Log("AutoRaid", "INFO", "raid selected: "..map)
+    Core.Emit("AutoRaid:Started", { map = map })
+end
+
+local function Raid_loop()
+    while Raid_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            if not Raid_isActive() then
+                Raid_start()
+            else
+                local island = Raid_findIsland()
+                if island then
+                    local root = Raid_getRoot()
+                    if root then
+                        local dist = (island.Position - root.Position).Magnitude
+                        if dist > 50 then
+                            pcall(function()
+                                root.CFrame = CFrame.new(island.Position + Vector3.new(0, 120, 0))
+                            end)
+                        end
+                    end
+                end
+            end
+        end)
+        task.wait(Raid_Config.CheckInterval)
+    end
+end
+
+function AutoRaid.Toggle(on)
+    if on == Raid_State.Enabled then return end
+    Raid_State.Enabled = on
+    if on then Core.StartModule("AutoRaid", Raid_loop)
+    else Core.StopModule("AutoRaid") end
+    Core.Log("AutoRaid", "INFO", on and "BẬT" or "TẮT")
+end
+
+function AutoRaid.SetMaps(maps)
+    if type(maps) == "table" then Raid_Config.RaidMaps = maps end
+end
+
+function AutoRaid.GetState()
+    return { Enabled = Raid_State.Enabled, RaidCount = Raid_State.RaidCount, CurrentMap = Raid_State.CurrentMap }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  MODULE 16 — FruitNotifier
+-- ══════════════════════════════════════════════════════════════════════════
+local FruitNotifier = {}
+local Notify_Config = { ScanInterval = 2.0, WebhookURL = "" }
+local Notify_State = { Enabled = false, Seen = {}, FruitCount = 0 }
+
+local function Notify_getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function Notify_sendWebhook(content)
+    if Notify_Config.WebhookURL == "" or not request then return end
+    pcall(request, {
+        Url = Notify_Config.WebhookURL,
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = Services.HttpService:JSONEncode({
+            username = "ZeroTiger Fruit Radar",
+            content = content,
+        }),
+    })
+end
+
+local function Notify_loop()
+    while Notify_State.Enabled and Core.State.Status == "RUNNING" do
+        pcall(function()
+            local root = Notify_getRoot()
+            if not root then return end
+            local fruits = API.ScanFruits(99999)
+            for _, f in ipairs(fruits) do
+                if not Notify_State.Seen[f.obj] then
+                    Notify_State.Seen[f.obj] = true
+                    Notify_State.FruitCount = Notify_State.FruitCount + 1
+                    local dist = (f.handle.Position - root.Position).Magnitude
+                    local coordStr = string.format("(%.0f, %.0f, %.0f)",
+                        f.handle.Position.X, f.handle.Position.Y, f.handle.Position.Z)
+                    Core.Log("FruitNotifier", "INFO",
+                        string.format("FRUIT: %s @ %s [%.0fm]", f.name, coordStr, dist))
+                    Notify_sendWebhook(string.format(
+                        "🍎 **Fruit Spawn**: `%s`\n📍 `%s`\n📏 %.0fm",
+                        f.name, coordStr, dist))
+                    pcall(function()
+                        local pg = LP:FindFirstChild("PlayerGui")
+                        local main = pg and pg:FindFirstChild("Main")
+                        local radar = main and main:FindFirstChild("Radar")
+                        if radar then
+                            radar.Text = string.format("%s (%dm)", f.name, math.floor(dist))
+                            radar.Visible = true
+                        end
+                    end)
+                    Core.Emit("FruitNotifier:Detected", {
+                        name = f.name, pos = f.handle.Position, dist = dist,
+                    })
+                end
+            end
+        end)
+        task.wait(Notify_Config.ScanInterval)
+    end
+end
+
+function FruitNotifier.Toggle(on)
+    if on == Notify_State.Enabled then return end
+    Notify_State.Enabled = on
+    if on then Core.StartModule("FruitNotifier", Notify_loop)
+    else Core.StopModule("FruitNotifier") end
+    Core.Log("FruitNotifier", "INFO", on and "BẬT" or "TẮT")
+end
+
+function FruitNotifier.SetWebhook(url) Notify_Config.WebhookURL = url or "" end
+function FruitNotifier.GetState()
+    return { Enabled = Notify_State.Enabled, Detected = Notify_State.FruitCount }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  UI — Fluent Window
+-- ══════════════════════════════════════════════════════════════════════════
+local Fluent = loadstring(game:HttpGet(
+    "https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+local Window = Fluent:CreateWindow({
+    Title    = "ZeroTiger v4.2",
+    SubTitle = "Blox Fruits · "..Services.LP.Name,
+    Size     = UDim2.fromOffset(560, 420),
+    Acrylic  = true,
+})
+
+local Tabs = {
+    Farm      = Window:AddTab({ Title = "Farm" }),
+    Quest     = Window:AddTab({ Title = "Quest" }),
+    ESP       = Window:AddTab({ Title = "ESP" }),
+    Bosses    = Window:AddTab({ Title = "Bosses" }),
+    Movement  = Window:AddTab({ Title = "Movement" }),
+    Items     = Window:AddTab({ Title = "Items" }),
+    Hop       = Window:AddTab({ Title = "Hop" }),
+    Fishing   = Window:AddTab({ Title = "Fishing" }),
+    AntiDet   = Window:AddTab({ Title = "Anti-Detect" }),
+    Status    = Window:AddTab({ Title = "Status" }),
+}
+
+-- ── FARM ──────────────────────────────────────────────────────────────────
+Tabs.Farm:AddToggle("FastAttack", {
+    Title = "Fast Attack", Default = true,
+    Callback = function(v) FastAttack.Toggle(v) end,
+})
+Tabs.Farm:AddToggle("AutoFarm", {
+    Title = "Auto Farm", Default = false,
+    Callback = function(v) Farm.Toggle(v) end,
+})
+Tabs.Farm:AddSlider("FarmRange", {
+    Title = "Farm Range", Default = 300, Min = 50, Max = 1000,
+    Callback = function(v) Farm.SetRange(v) end,
+})
+Tabs.Farm:AddToggle("AutoBuso", {
+    Title = "Auto Buso Haki", Default = false,
+    Callback = function(v) AutoHaki.ToggleBuso(v) end,
+})
+Tabs.Farm:AddToggle("AutoKen", {
+    Title = "Auto Ken Haki", Default = false,
+    Callback = function(v) AutoHaki.ToggleKen(v) end,
+})
+
+-- ── QUEST ─────────────────────────────────────────────────────────────────
+Tabs.Quest:AddToggle("AutoQuest", {
+    Title = "Auto Quest (nhận/trả quest)", Default = false,
+    Callback = function(v) AutoQuest.Toggle(v) end,
+})
+Tabs.Quest:AddButton({
+    Title = "Abandon Quest",
+    Callback = function() AutoQuest.Abandon() end,
+})
+
+-- ── ESP ───────────────────────────────────────────────────────────────────
+for _, kind in ipairs({ "Player", "Boss", "Fruit", "Chest" }) do
+    Tabs.ESP:AddToggle("ESP"..kind, {
+        Title = kind.." ESP",
+        Callback = function(v)
+            ESP.SetFilter(kind, v)
+            local s = ESP.GetState()
+            local any = s.Filters.Player or s.Filters.Boss or s.Filters.Fruit or s.Filters.Chest
+            ESP.Toggle(any)
+        end,
+    })
+end
+
+-- ── BOSSES ────────────────────────────────────────────────────────────────
+for _, boss in ipairs({ "Rip Indra", "Cake Prince", "Longma", "Golem", "Draco", "Elite Hunter", "Soul Reaper", "Greybeard", "Katakuri" }) do
+    Tabs.Bosses:AddToggle("Boss_"..boss, {
+        Title = boss,
+        Callback = function(v) Boss.Toggle(boss, v) end,
+    })
+end
+
+-- ── MOVEMENT ──────────────────────────────────────────────────────────────
+Tabs.Movement:AddSlider("Speed", {
+    Title = "Walk Speed", Default = 16, Min = 16, Max = 500,
+    Callback = function(v) Movement.SetSpeed(v) end,
+})
+Tabs.Movement:AddSlider("Jump", {
+    Title = "Jump Power", Default = 50, Min = 50, Max = 500,
+    Callback = function(v) Movement.SetJump(v) end,
+})
+Tabs.Movement:AddToggle("Noclip", {
+    Title = "Noclip", Default = false,
+    Callback = function(v) Movement.ToggleNoclip(v) end,
+})
+Tabs.Movement:AddToggle("InfJump", {
+    Title = "Infinite Jump", Default = false,
+    Callback = function(v) Movement.ToggleInfJump(v) end,
+})
+Tabs.Movement:AddToggle("WalkWater", {
+    Title = "Walk on Water", Default = false,
+    Callback = function(v) Movement.ToggleWalkWater(v) end,
+})
+
+-- ── ITEMS ─────────────────────────────────────────────────────────────────
+Tabs.Items:AddToggle("Sniper", {
+    Title = "Fruit Sniper", Default = false,
+    Callback = function(v) FruitSniper.Toggle(v) end,
+})
+Tabs.Items:AddSlider("SniperRange", {
+    Title = "Sniper Range", Default = 3000, Min = 500, Max = 5000,
+    Callback = function(v) FruitSniper.SetRange(v) end,
+})
+Tabs.Items:AddToggle("AutoPickup", {
+    Title = "Auto Pickup (Chest/Fruit/Drop)", Default = false,
+    Callback = function(v) AutoPickup.Toggle(v) end,
+})
+Tabs.Items:AddToggle("PickChest", {
+    Title = "  → Chest", Default = true,
+    Callback = function(v) AutoPickup.SetCategory("Chest", v) end,
+})
+Tabs.Items:AddToggle("PickFruit", {
+    Title = "  → Fruit", Default = true,
+    Callback = function(v) AutoPickup.SetCategory("Fruit", v) end,
+})
+Tabs.Items:AddToggle("PickDrop", {
+    Title = "  → Drop (tool on ground)", Default = true,
+    Callback = function(v) AutoPickup.SetCategory("Drop", v) end,
+})
+Tabs.Items:AddToggle("AutoBuy", {
+    Title = "Auto Buy", Default = false,
+    Callback = function(v) AutoBuy.Toggle(v) end,
+})
+for _, flag in ipairs({ "Haki", "Geppo", "Soru", "Sword", "Gun", "Fruit" }) do
+    Tabs.Items:AddToggle("Buy"..flag, {
+        Title = "  → Buy "..flag, Default = (flag == "Haki" or flag == "Geppo" or flag == "Soru"),
+        Callback = function(v) AutoBuy.SetFlag(flag, v) end,
+    })
+end
+
+-- ── HOP ───────────────────────────────────────────────────────────────────
+Tabs.Hop:AddButton({
+    Title = "Server Hop",
+    Callback = function() Hop.Hop() end,
+})
+Tabs.Hop:AddButton({
+    Title = "Rejoin",
+    Callback = function() Hop.Rejoin() end,
+})
+Tabs.Hop:AddToggle("AutoHop", {
+    Title = "Auto Hop (khi bị theo dõi)", Default = false,
+    Callback = function(v) Hop.ToggleAutoHop(v) end,
+})
+Tabs.Hop:AddToggle("Reconnect", {
+    Title = "Auto Reconnect (kick)", Default = true,
+    Callback = function(v) Hop.SetReconnect(v) end,
+})
+
+-- ── FISHING ───────────────────────────────────────────────────────────────
+Tabs.Fishing:AddToggle("AutoFish", {
+    Title = "Auto Fish", Default = false,
+    Callback = function(v) Fishing.Toggle(v) end,
+})
+
+-- ── ANTI-DETECTION ────────────────────────────────────────────────────────
+Tabs.AntiDet:AddSlider("ClickDelay", {
+    Title = "Click Delay", Default = 0.2, Min = 0.05, Max = 1.0,
+    Callback = function(v) AntiDetection.SetClickDelay(v) end,
+})
+Tabs.AntiDet:AddToggle("RandomY", {
+    Title = "Random Y Tween", Default = false,
+    Callback = function(v) AntiDetection.SetRandomYTween(v) end,
+})
+Tabs.AntiDet:AddToggle("RandomPos", {
+    Title = "Random Position", Default = false,
+    Callback = function(v) AntiDetection.SetRandomPosition(v) end,
+})
+Tabs.AntiDet:AddToggle("HitRun", {
+    Title = "Hit And Run", Default = true,
+    Callback = function(v) AntiDetection.SetHitAndRun(v) end,
+})
+Tabs.AntiDet:AddToggle("Predict", {
+    Title = "Predict Move", Default = true,
+    Callback = function(v) AntiDetection.SetPredictMove(v) end,
+})
+
+-- ── STATUS ────────────────────────────────────────────────────────────────
+Tabs.Status:AddParagraph({ Title = "Version", Content = "ZeroTiger v4.2 — Complete" })
+Tabs.Status:AddParagraph({ Title = "Player", Content = Services.LP.Name })
+Tabs.Status:AddParagraph({ Title = "Place", Content = tostring(game.PlaceId) })
+Tabs.Status:AddButton({
+    Title = "Debug — API state",
+    Callback = function()
+        local s = API.GetState()
+        Core.Log("DEBUG", string.format("CommF=%s Hooked=%s", tostring(s.CommF), tostring(s.Hooked)))
+    end,
+})
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  BUILD UIToggle SAU KHI WINDOW CÓ
+-- ══════════════════════════════════════════════════════════════════════════
+UIToggle.Build(Window)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  READY
+-- ══════════════════════════════════════════════════════════════════════════
+Core.Log("INIT", "INFO", "ZeroTiger v4.2 — COMPLETE — 16 modules loaded")
+Fluent:Notify({ Title = "ZeroTiger v4.2", Content = "Complete Edition — sẵn sàng!", Duration = 5 })
